@@ -12,6 +12,7 @@ import argparse
 import glob
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -24,21 +25,51 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
+from torch.utils.data import DataLoader
+
 from code4maskgeneration.cvae import CondVAE
-from code4maskgeneration.mvtec_mask_dataset import list_seg_mask_categories, list_training_defect_types
+from code4maskgeneration.mvtec_mask_dataset import (
+    Mask2MaskDataset,
+    list_seg_mask_categories,
+    list_training_defect_types,
+)
+from code4maskgeneration.train_mask_generation_cvae import (
+    REL_HIST_BINS_DT,
+    REL_HIST_BINS_WIDTH,
+    _cond_morphology_batch,
+    _rel_hist_loss,
+    _rel_histogram,
+    compute_dataset_rel_hist_prior,
+)
 
-
-# 这些通常不需要走命令行参数，直接在代码里改即可
+DEFAULT_DATASET_ROOT = "/home/wyh/data/mvtec_ad/seg_mask"
+DEFAULT_OUTPUT_ROOT = "/d242/wyh/M2M"
+DEFAULT_INFER_MASK_ROOT = "/home/wyh/data/mvtec_ad"
+WEIGHTS_SUBDIR = "genmask_cvae"
 IMG_SIZE = 512
 LATENT_DIM = 64
+
 DROPOUT_P = 0.1
 CANDIDATE_POOL = 5
 MAX_RESAMPLE_ROUNDS = 20
 TEMPERATURE = 1.0
 THRESH = 0.5
-MIN_AREA_RATIO = 0.3
+MIN_CC_AREA_RATIO = 0.2
 MAX_AREA_RATIO = 1.0
 OVERLAY_ALPHA = 0.35
+
+
+def weights_dir_for_date(output_root: str, date_code: str) -> str:
+    return str(Path(output_root) / WEIGHTS_SUBDIR / f"weights_{date_code}")
+
+
+def infer_out_dir_for_date(infer_mask_root: str, date_code: str) -> str:
+    return str(Path(infer_mask_root) / f"generated_mask_{date_code}")
+
+
+def resolve_date_code(date_code: str | None) -> str:
+    """脚本内只调用一次，避免 parse 默认值与后续逻辑各取各的日期。"""
+    return date_code or datetime.now().strftime("%Y%m%d")
 
 
 def build_cond_tensor(binary_fg_path, device):
@@ -63,7 +94,8 @@ def sample_priors(model, cond, latent_dim, num_samples, temperature, device):
     return outs
 
 
-def postprocess_binary(mask_u8, min_area_ratio=0.3, reject_border_components=True):
+def filter_noise_components(mask_u8, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True):
+    """去除小于最大连通域一定比例的散点噪声，保留最大连通域及同量级连通域。"""
     if mask_u8.dtype != np.uint8:
         mask_u8 = mask_u8.astype(np.uint8)
 
@@ -92,6 +124,10 @@ def postprocess_binary(mask_u8, min_area_ratio=0.3, reject_border_components=Tru
                 continue
         out[labels == i] = 255
     return out
+
+
+def postprocess_binary(mask_u8, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True):
+    return filter_noise_components(mask_u8, min_area_ratio=min_area_ratio, reject_border_components=reject_border_components)
 
 
 def is_valid_mask(mask_u8, min_area_ratio=0.3, max_area_ratio=1.0):
@@ -145,21 +181,59 @@ def _mask_stats(mask_u8, ref_u8=None):
     }
 
 
-def _score_candidate(prob, bin_pp, cond_u8, cond_area):
+def _rel_hist_score(prob, cond_t, rel_hist_prior, device):
+    recon = torch.from_numpy(prob).float().to(device).unsqueeze(0).unsqueeze(0)
+    with torch.no_grad():
+        dt, width = _cond_morphology_batch(cond_t)
+        pred_hist = _rel_histogram(recon, dt, width)
+        prior_t = torch.from_numpy(rel_hist_prior).to(device)
+        loss = _rel_hist_loss(pred_hist, prior_t).item()
+    return 1.0 - loss
+
+
+def _score_candidate(
+    prob,
+    bin_pp,
+    cond_u8,
+    cond_t,
+    rel_hist_prior,
+    device,
+    min_area=None,
+    max_area=None,
+    target_inside_cond=None,
+):
     bin_u8 = ((bin_pp > 0).astype(np.uint8))
     area = float(bin_u8.sum())
     if area <= 0:
         return -1e9
-    stats = _mask_stats(bin_u8 * 255, ref_u8=cond_u8)
-    cond_stats = _mask_stats(cond_u8)
-    center_dist = float(np.sqrt((stats["centroid"][0] - cond_stats["centroid"][0]) ** 2 + (stats["centroid"][1] - cond_stats["centroid"][1]) ** 2))
-    area_ratio = area / max(cond_area, 1.0)
-    area_prior = np.exp(-abs(np.log(max(area_ratio, 1e-6))))
-    overlap_bonus = stats["iou"] * 2.5 + stats["overlap_ratio"] * 1.5
-    center_bonus = np.exp(-3.0 * center_dist)
-    border_penalty = 0.35 if stats["touches_border"] else 0.0
+
+    cond = (cond_u8 > 0).astype(np.uint8)
+    pred_mass = max(float(bin_u8.sum()), 1.0)
+    inside_ratio = float((bin_u8 & cond).sum()) / pred_mass
+    target_inside = 1.0 if target_inside_cond is None else float(target_inside_cond)
+    match_bonus = 1.0 - abs(inside_ratio - target_inside)
+    excess_outside = max(0.0, target_inside - inside_ratio)
+
+    stats = _mask_stats(bin_u8 * 255)
+    border_penalty = 0.5 if stats["touches_border"] else 0.0
     prob_bonus = float(prob[bin_u8 > 0].mean()) if (bin_u8 > 0).any() else float(prob.mean()) * 0.5
-    return float(prob_bonus + overlap_bonus + center_bonus + 0.8 * area_prior - border_penalty)
+
+    area_pen = 0.0
+    if min_area is not None and area < float(min_area):
+        area_pen += (float(min_area) - area) / float(IMG_SIZE * IMG_SIZE)
+    if max_area is not None and area > float(max_area):
+        area_pen += (area - float(max_area)) / float(IMG_SIZE * IMG_SIZE)
+
+    rel_bonus = _rel_hist_score(prob, cond_t, rel_hist_prior, device)
+
+    return float(
+        prob_bonus
+        + 3.0 * match_bonus
+        + 2.5 * rel_bonus
+        - 2.0 * excess_outside
+        - border_penalty
+        - area_pen
+    )
 
 
 def blend_red_overlay(bgr, mask_u8, alpha):
@@ -221,16 +295,72 @@ def collect_gt_area_range(dataset_root, category, defect, img_size=IMG_SIZE):
     }
 
 
-def pick_best_mask(prob_list, thresh, cond, min_area=None, max_area=None):
+def _load_rel_hist_prior(dataset_root, category, defect, img_size=IMG_SIZE):
+    dataset = Mask2MaskDataset(
+        root_dir=dataset_root,
+        category=category,
+        defect_type=defect,
+        img_size=img_size,
+        augment=False,
+    )
+    if len(dataset) == 0:
+        n = REL_HIST_BINS_DT * REL_HIST_BINS_WIDTH
+        return np.ones(n, dtype=np.float32) / n
+    return compute_dataset_rel_hist_prior(dataset)
+
+
+def collect_gt_cond_inside_stats(dataset_root, category, defect, img_size=IMG_SIZE):
+    """GT 异常落在 cond（test 前景）内的质量占比，与训练统计一致。"""
+    dataset = Mask2MaskDataset(
+        root_dir=dataset_root,
+        category=category,
+        defect_type=defect,
+        img_size=img_size,
+        augment=False,
+    )
+    if len(dataset) == 0:
+        return None
+
+    ratios = []
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    for cond, gt in loader:
+        cond_bin = (cond > 0.5).float()
+        gt_bin = (gt > 0.5).float()
+        gt_mass = float(gt_bin.sum().item())
+        if gt_mass < 1.0:
+            continue
+        inside = float((gt_bin * cond_bin).sum().item())
+        ratios.append(inside / gt_mass)
+
+    if not ratios:
+        return None
+
+    return {
+        "min": float(min(ratios)),
+        "max": float(max(ratios)),
+        "mean": float(np.mean(ratios)),
+        "count": len(ratios),
+    }
+
+
+def pick_best_mask(
+    prob_list,
+    thresh,
+    cond,
+    rel_hist_prior,
+    device,
+    min_area=None,
+    max_area=None,
+    target_inside_cond=None,
+):
     cond_u8 = (cond.squeeze().detach().cpu().numpy() > 0.5).astype(np.uint8) * 255
-    cond_area = float((cond_u8 > 0).sum())
     best = None
     best_score = -1e9
     fallback = None
     fallback_score = -1e9
     for prob in prob_list:
         bin_m = ((prob > thresh).astype(np.uint8)) * 255
-        bin_pp = postprocess_binary(bin_m, min_area_ratio=0.0, reject_border_components=True)
+        bin_pp = filter_noise_components(bin_m, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True)
         area = int((bin_pp > 0).sum())
         valid = area > 0 and not _touches_image_border(bin_pp)
         if min_area is not None:
@@ -238,7 +368,17 @@ def pick_best_mask(prob_list, thresh, cond, min_area=None, max_area=None):
         if max_area is not None:
             valid = valid and area <= int(max_area)
         if valid:
-            score = _score_candidate(prob, bin_pp, cond_u8, cond_area)
+            score = _score_candidate(
+                prob,
+                bin_pp,
+                cond_u8,
+                cond,
+                rel_hist_prior,
+                device,
+                min_area=min_area,
+                max_area=max_area,
+                target_inside_cond=target_inside_cond,
+            )
             if score > best_score:
                 best_score = score
                 best = {"bin": bin_pp, "prob": prob, "score": score, "reason": "ok"}
@@ -271,31 +411,67 @@ def match_weight_to_category(weight_path, category):
     return name.startswith(expected) and name.endswith(".pth") and len(name) > len(expected) + 4
 
 
+def defect_from_weight_filename(weight_filename, category):
+    """从权重文件名 `{category}_{defect}.pth` 解析缺陷名。"""
+    name = os.path.basename(weight_filename)
+    expected = f"{category}_"
+    if not name.startswith(expected) or not name.endswith(".pth"):
+        return None
+    defect = name[len(expected) : -len(".pth")]
+    if not defect:
+        return None
+    for suffix in ("_best", "_final"):
+        if defect.endswith(suffix):
+            return defect[: -len(suffix)]
+    return defect
+
+
 def run_one_mask(model_paths, cond, category, stem, bg_path, out_root, device, dataset_root):
     for wp in model_paths:
         name = os.path.basename(wp)
         expected = f"{category}_"
         if not name.startswith(expected) or not name.endswith(".pth"):
             continue
-        defect = name[len(expected) : -len(".pth")]
+        defect = defect_from_weight_filename(name, category)
         if not defect:
             continue
+        output_tag = defect
         model = CondVAE(latent_dim=LATENT_DIM, cond_channels=1, dropout_p=DROPOUT_P).to(device)
         model.load_state_dict(torch.load(wp, map_location=device))
 
         area_range = collect_gt_area_range(dataset_root, category, defect, img_size=IMG_SIZE)
+        cond_inside = collect_gt_cond_inside_stats(dataset_root, category, defect, img_size=IMG_SIZE)
+        rel_hist_prior = _load_rel_hist_prior(dataset_root, category, defect)
+        print(f"[*] {category}/{defect}: rel_hist peak={rel_hist_prior.max():.4f}")
         if area_range is None:
             print(f"[!] {category}/{defect}: 未找到 gt 面积统计，跳过面积约束")
         else:
             print(f"[*] {category}/{defect}: gt area range = [{area_range['min']}, {area_range['max']}], count={area_range['count']}")
+        if cond_inside is None:
+            print(f"[!] {category}/{defect}: 未找到 gt/cond 重叠统计，cond 内占比目标默认 1.0")
+        else:
+            print(
+                f"[*] {category}/{defect}: gt 在 cond 内质量占比 "
+                f"min={cond_inside['min']:.3f}, max={cond_inside['max']:.3f}, mean={cond_inside['mean']:.3f}"
+            )
 
         min_area = area_range["min"] if area_range else None
         max_area = area_range["max"] if area_range else None
+        target_inside_cond = cond_inside["mean"] if cond_inside else None
 
         best = None
         for round_idx in range(MAX_RESAMPLE_ROUNDS):
             probs = sample_priors(model, cond, LATENT_DIM, CANDIDATE_POOL, TEMPERATURE, device)
-            candidate = pick_best_mask(probs, THRESH, cond, min_area=min_area, max_area=max_area)
+            candidate = pick_best_mask(
+                probs,
+                THRESH,
+                cond,
+                rel_hist_prior,
+                device,
+                min_area=min_area,
+                max_area=max_area,
+                target_inside_cond=target_inside_cond,
+            )
             if candidate is None:
                 continue
             area = int((candidate["bin"] > 0).sum())
@@ -310,12 +486,15 @@ def run_one_mask(model_paths, cond, category, stem, bg_path, out_root, device, d
             cond_fg_u8 = (cond.squeeze().cpu().numpy() > 0.5).astype(np.uint8) * 255
             best = {"bin": np.zeros_like(cond_fg_u8, dtype=np.uint8), "prob": np.zeros_like(cond_fg_u8, dtype=np.float32), "score": -1e9, "reason": "no_valid_candidate"}
 
-        sub = os.path.join(out_root, category, defect)
+        sub = os.path.join(out_root, category, output_tag)
         os.makedirs(sub, exist_ok=True)
 
         img_bgr = cv2.imread(bg_path, cv2.IMREAD_COLOR)
         if img_bgr is None:
             raise FileNotFoundError(f"无法读取 overlay 背景图: {bg_path}")
+
+        final_bin = filter_noise_components(best["bin"], min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True)
+        best["bin"] = final_bin
 
         out_mask = os.path.join(sub, f"{stem}_mask.png")
         cv2.imwrite(out_mask, best["bin"])
@@ -326,18 +505,26 @@ def run_one_mask(model_paths, cond, category, stem, bg_path, out_root, device, d
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset_root", type=str, default="/home/wyh/data/mvtec_ad/seg_mask")
+    p.add_argument("--dataset_root", type=str, default=DEFAULT_DATASET_ROOT)
+    p.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
+    p.add_argument("--infer_mask_root", type=str, default=DEFAULT_INFER_MASK_ROOT)
+    p.add_argument(
+        "--date_code",
+        type=str,
+        default=None,
+        help="YYYYMMDD；需与训练一致，run_genmask_train_infer.py 会在启动时固定并传入",
+    )
     p.add_argument(
         "--weights_dir",
         type=str,
-        default=os.path.join(os.path.dirname(__file__), "weights"),
-        help="权重目录",
+        default=None,
+        help="显式指定时覆盖 date_code 推导结果",
     )
     p.add_argument(
         "--out_dir",
         type=str,
-        default="./outputs/cvae_prior",
-        help="输出目录",
+        default=None,
+        help="显式指定时覆盖 date_code 推导结果",
     )
     p.add_argument(
         "--good_dir",
@@ -364,19 +551,29 @@ def main():
     )
     args = p.parse_args()
 
+    date_code = resolve_date_code(args.date_code)
+    weights_dir = args.weights_dir or weights_dir_for_date(args.output_root, date_code)
+    out_dir = args.out_dir or infer_out_dir_for_date(args.infer_mask_root, date_code)
+    print(f"[*] date_code={date_code}, weights_dir={weights_dir}, out_dir={out_dir}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
     def weights_for_category(cat):
-        paths = sorted(glob.glob(os.path.join(args.weights_dir, "*.pth")))
-        best_paths = [p for p in paths if os.path.isfile(p) and os.path.basename(p).startswith(f"{cat}_") and os.path.basename(p).endswith("_best.pth")]
-        if best_paths:
-            return best_paths
-        final_paths = [p for p in paths if os.path.isfile(p) and os.path.basename(p).startswith(f"{cat}_") and os.path.basename(p).endswith("_final.pth")]
-        if final_paths:
-            print(f"[!] {cat}: 未找到 *_best.pth，回退使用 *_final.pth")
-            return final_paths
-        return [p for p in paths if os.path.isfile(p) and match_weight_to_category(p, cat)]
+        paths = sorted(glob.glob(os.path.join(weights_dir, "*.pth")))
+        matched = [p for p in paths if os.path.isfile(p) and match_weight_to_category(p, cat)]
+        current = [p for p in matched if not os.path.basename(p).endswith(("_best.pth", "_final.pth"))]
+        if current:
+            return current
+        legacy = [p for p in matched if os.path.basename(p).endswith("_best.pth")]
+        if legacy:
+            print(f"[!] {cat}: 未找到新格式权重，回退使用旧版 *_best.pth")
+            return legacy
+        legacy_final = [p for p in matched if os.path.basename(p).endswith("_final.pth")]
+        if legacy_final:
+            print(f"[!] {cat}: 未找到新格式权重，回退使用旧版 *_final.pth")
+            return legacy_final
+        return matched
 
     def infer_category_good(cat, mask_paths):
         paths = weights_for_category(cat)
@@ -386,7 +583,7 @@ def main():
         for mp in mask_paths:
             stem = os.path.splitext(os.path.basename(mp))[0]
             cond = build_cond_tensor(mp, device)
-            run_one_mask(paths, cond, cat, stem, mp, args.out_dir, device, args.dataset_root)
+            run_one_mask(paths, cond, cat, stem, mp, out_dir, device, args.dataset_root)
 
     if args.run_all_good:
         cats = list_seg_mask_categories(args.dataset_root)
