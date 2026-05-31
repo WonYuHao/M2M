@@ -36,10 +36,14 @@ from code4maskgeneration.mvtec_mask_dataset import (
 from code4maskgeneration.train_mask_generation_cvae import (
     REL_HIST_BINS_DT,
     REL_HIST_BINS_WIDTH,
+    UV_HIST_BINS,
     _cond_morphology_batch,
+    _cond_uv_maps_batch,
     _rel_hist_loss,
     _rel_histogram,
+    _uv_histogram,
     compute_dataset_rel_hist_prior,
+    compute_dataset_uv_hist_prior,
 )
 
 DEFAULT_DATASET_ROOT = "/home/wyh/data/mvtec_ad/seg_mask"
@@ -57,6 +61,7 @@ THRESH = 0.5
 MIN_CC_AREA_RATIO = 0.2
 MAX_AREA_RATIO = 1.0
 OVERLAY_ALPHA = 0.35
+INFER_UV_BONUS = 2.5
 
 
 def weights_dir_for_date(output_root: str, date_code: str) -> str:
@@ -94,25 +99,25 @@ def sample_priors(model, cond, latent_dim, num_samples, temperature, device):
     return outs
 
 
-def filter_noise_components(mask_u8, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True):
-    """去除小于最大连通域一定比例的散点噪声，保留最大连通域及同量级连通域。"""
-    if mask_u8.dtype != np.uint8:
-        mask_u8 = mask_u8.astype(np.uint8)
+def _list_component_masks(bin_m, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True):
+    """返回通过面积/边界筛选的各连通域二值 mask 列表。"""
+    if bin_m.dtype != np.uint8:
+        bin_m = (bin_m > 0).astype(np.uint8) * 255
+    else:
+        bin_m = ((bin_m > 0).astype(np.uint8)) * 255
 
-    bin_m = (mask_u8 > 0).astype(np.uint8) * 255
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_m)
     if num_labels <= 1:
-        return bin_m
+        return [bin_m] if int(bin_m.sum()) > 0 else []
 
     areas = stats[1:, cv2.CC_STAT_AREA]
     if len(areas) == 0:
-        return np.zeros_like(bin_m)
+        return []
 
     max_area = int(areas.max())
     keep_thr = max(1, int(max_area * float(min_area_ratio)))
-
-    out = np.zeros_like(bin_m)
     h, w = bin_m.shape[:2]
+    comps = []
     for i in range(1, num_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < keep_thr:
@@ -122,12 +127,99 @@ def filter_noise_components(mask_u8, min_area_ratio=MIN_CC_AREA_RATIO, reject_bo
             touches_border = x <= 0 or y <= 0 or (x + bw) >= w or (y + bh) >= h
             if touches_border:
                 continue
-        out[labels == i] = 255
+        comp = np.zeros_like(bin_m)
+        comp[labels == i] = 255
+        comps.append(comp)
+    return comps
+
+
+def select_best_connected_component(
+    mask_u8,
+    prob,
+    cond_u8,
+    cond_t,
+    rel_hist_prior,
+    uv_hist_prior,
+    device,
+    min_area=None,
+    max_area=None,
+    target_inside_cond=None,
+    min_area_ratio=MIN_CC_AREA_RATIO,
+    reject_border_components=True,
+):
+    """多连通域时按与训练一致的打分只保留最佳一块（减轻中心伪影+真位置双峰）。"""
+    comps = _list_component_masks(
+        mask_u8,
+        min_area_ratio=min_area_ratio,
+        reject_border_components=reject_border_components,
+    )
+    if not comps:
+        return np.zeros_like(mask_u8, dtype=np.uint8)
+
+    best_mask = comps[0]
+    best_score = -1e9
+    for comp in comps:
+        score = _score_candidate(
+            prob,
+            comp,
+            cond_u8,
+            cond_t,
+            rel_hist_prior,
+            uv_hist_prior,
+            device,
+            min_area=min_area,
+            max_area=max_area,
+            target_inside_cond=target_inside_cond,
+        )
+        if score > best_score:
+            best_score = score
+            best_mask = comp
+    return best_mask
+
+
+def postprocess_binary(
+    mask_u8,
+    prob=None,
+    cond_u8=None,
+    cond_t=None,
+    rel_hist_prior=None,
+    uv_hist_prior=None,
+    device=None,
+    min_area=None,
+    max_area=None,
+    target_inside_cond=None,
+    min_area_ratio=MIN_CC_AREA_RATIO,
+    reject_border_components=True,
+):
+    if (
+        prob is not None
+        and cond_u8 is not None
+        and cond_t is not None
+        and rel_hist_prior is not None
+        and uv_hist_prior is not None
+        and device is not None
+    ):
+        return select_best_connected_component(
+            mask_u8,
+            prob,
+            cond_u8,
+            cond_t,
+            rel_hist_prior,
+            uv_hist_prior,
+            device,
+            min_area=min_area,
+            max_area=max_area,
+            target_inside_cond=target_inside_cond,
+            min_area_ratio=min_area_ratio,
+            reject_border_components=reject_border_components,
+        )
+    comps = _list_component_masks(mask_u8, min_area_ratio, reject_border_components)
+    if not comps:
+        return np.zeros_like(mask_u8, dtype=np.uint8)
+    out = np.zeros_like(comps[0])
+    for comp in comps:
+        out = np.maximum(out, comp)
     return out
-
-
-def postprocess_binary(mask_u8, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True):
-    return filter_noise_components(mask_u8, min_area_ratio=min_area_ratio, reject_border_components=reject_border_components)
 
 
 def is_valid_mask(mask_u8, min_area_ratio=0.3, max_area_ratio=1.0):
@@ -191,12 +283,23 @@ def _rel_hist_score(prob, cond_t, rel_hist_prior, device):
     return 1.0 - loss
 
 
+def _uv_hist_score(prob, cond_t, uv_hist_prior, device):
+    recon = torch.from_numpy(prob).float().to(device).unsqueeze(0).unsqueeze(0)
+    with torch.no_grad():
+        u_map, v_map = _cond_uv_maps_batch(cond_t)
+        pred_hist = _uv_histogram(recon, u_map, v_map)
+        prior_t = torch.from_numpy(uv_hist_prior).to(device)
+        loss = _rel_hist_loss(pred_hist, prior_t).item()
+    return 1.0 - loss
+
+
 def _score_candidate(
     prob,
     bin_pp,
     cond_u8,
     cond_t,
     rel_hist_prior,
+    uv_hist_prior,
     device,
     min_area=None,
     max_area=None,
@@ -225,11 +328,13 @@ def _score_candidate(
         area_pen += (area - float(max_area)) / float(IMG_SIZE * IMG_SIZE)
 
     rel_bonus = _rel_hist_score(prob, cond_t, rel_hist_prior, device)
+    uv_bonus = _uv_hist_score(prob, cond_t, uv_hist_prior, device)
 
     return float(
         prob_bonus
         + 3.0 * match_bonus
         + 2.5 * rel_bonus
+        + INFER_UV_BONUS * uv_bonus
         - 2.0 * excess_outside
         - border_penalty
         - area_pen
@@ -309,6 +414,20 @@ def _load_rel_hist_prior(dataset_root, category, defect, img_size=IMG_SIZE):
     return compute_dataset_rel_hist_prior(dataset)
 
 
+def _load_uv_hist_prior(dataset_root, category, defect, img_size=IMG_SIZE):
+    dataset = Mask2MaskDataset(
+        root_dir=dataset_root,
+        category=category,
+        defect_type=defect,
+        img_size=img_size,
+        augment=False,
+    )
+    if len(dataset) == 0:
+        n = UV_HIST_BINS * UV_HIST_BINS
+        return np.ones(n, dtype=np.float32) / n
+    return compute_dataset_uv_hist_prior(dataset)
+
+
 def collect_gt_cond_inside_stats(dataset_root, category, defect, img_size=IMG_SIZE):
     """GT 异常落在 cond（test 前景）内的质量占比，与训练统计一致。"""
     dataset = Mask2MaskDataset(
@@ -348,6 +467,7 @@ def pick_best_mask(
     thresh,
     cond,
     rel_hist_prior,
+    uv_hist_prior,
     device,
     min_area=None,
     max_area=None,
@@ -360,7 +480,18 @@ def pick_best_mask(
     fallback_score = -1e9
     for prob in prob_list:
         bin_m = ((prob > thresh).astype(np.uint8)) * 255
-        bin_pp = filter_noise_components(bin_m, min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True)
+        bin_pp = select_best_connected_component(
+            bin_m,
+            prob,
+            cond_u8,
+            cond,
+            rel_hist_prior,
+            uv_hist_prior,
+            device,
+            min_area=min_area,
+            max_area=max_area,
+            target_inside_cond=target_inside_cond,
+        )
         area = int((bin_pp > 0).sum())
         valid = area > 0 and not _touches_image_border(bin_pp)
         if min_area is not None:
@@ -374,6 +505,7 @@ def pick_best_mask(
                 cond_u8,
                 cond,
                 rel_hist_prior,
+                uv_hist_prior,
                 device,
                 min_area=min_area,
                 max_area=max_area,
@@ -442,7 +574,11 @@ def run_one_mask(model_paths, cond, category, stem, bg_path, out_root, device, d
         area_range = collect_gt_area_range(dataset_root, category, defect, img_size=IMG_SIZE)
         cond_inside = collect_gt_cond_inside_stats(dataset_root, category, defect, img_size=IMG_SIZE)
         rel_hist_prior = _load_rel_hist_prior(dataset_root, category, defect)
-        print(f"[*] {category}/{defect}: rel_hist peak={rel_hist_prior.max():.4f}")
+        uv_hist_prior = _load_uv_hist_prior(dataset_root, category, defect)
+        print(
+            f"[*] {category}/{defect}: rel_hist peak={rel_hist_prior.max():.4f}, "
+            f"uv_hist peak={uv_hist_prior.max():.4f} (bins={UV_HIST_BINS})"
+        )
         if area_range is None:
             print(f"[!] {category}/{defect}: 未找到 gt 面积统计，跳过面积约束")
         else:
@@ -467,6 +603,7 @@ def run_one_mask(model_paths, cond, category, stem, bg_path, out_root, device, d
                 THRESH,
                 cond,
                 rel_hist_prior,
+                uv_hist_prior,
                 device,
                 min_area=min_area,
                 max_area=max_area,
@@ -493,7 +630,18 @@ def run_one_mask(model_paths, cond, category, stem, bg_path, out_root, device, d
         if img_bgr is None:
             raise FileNotFoundError(f"无法读取 overlay 背景图: {bg_path}")
 
-        final_bin = filter_noise_components(best["bin"], min_area_ratio=MIN_CC_AREA_RATIO, reject_border_components=True)
+        final_bin = select_best_connected_component(
+            best["bin"],
+            best["prob"],
+            (cond.squeeze().detach().cpu().numpy() > 0.5).astype(np.uint8) * 255,
+            cond,
+            rel_hist_prior,
+            uv_hist_prior,
+            device,
+            min_area=min_area,
+            max_area=max_area,
+            target_inside_cond=target_inside_cond,
+        )
         best["bin"] = final_bin
 
         out_mask = os.path.join(sub, f"{stem}_mask.png")

@@ -9,7 +9,8 @@
 - 双路径损失：posterior 重建 + prior 随机 z 解码
 - overlap：pred 在 cond 内占比 ≈ GT 在 cond 内占比
 - rel_hist：GT 质量在 cond 形态空间 (深度 DT, 局部宽度) 的分布
-- band：recon 路径在 cond 邻域带内与 GT 的软重叠（同图坐标）
+- band：recon / prior 在 cond 邻域带内与 GT 的软重叠（同图坐标）
+- centroid / uv_hist：cond 外接框归一化坐标下的质心与 2D 位置分布（普适，不依赖骨架）
 """
 
 import argparse
@@ -67,6 +68,13 @@ LOCAL_WIDTH_KERNEL = 25
 PRIOR_WEIGHT = 1.75
 PRIOR_SAMPLES = 2
 GEN_EVAL_Z = 3
+UV_HIST_BINS = 8
+UV_HIST_WEIGHT = 2.0
+CENTROID_WEIGHT = 1.0
+PRIOR_BAND_WEIGHT = 1.5
+GEN_W_BAND = 1.5
+GEN_W_CENTROID = 1.0
+GEN_W_UV_HIST = 2.0
 
 
 def _dice_loss(recon_x: torch.Tensor, x: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
@@ -192,6 +200,108 @@ def _rel_hist_loss(pred_hist: torch.Tensor, target_hist: torch.Tensor) -> torch.
     return F.l1_loss(pred_hist, target)
 
 
+def _cond_uv_maps(cond_u8: np.ndarray):
+    """cond 外接框归一化坐标 u,v ∈ [0,1]，仅在 cond 内有意义。"""
+    c = (cond_u8 > 0.5)
+    h, w = c.shape
+    u_map = np.zeros((h, w), dtype=np.float32)
+    v_map = np.zeros((h, w), dtype=np.float32)
+    if not c.any():
+        return u_map, v_map
+    ys, xs = np.where(c)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    denom_y = float(max(y1 - y0, 1))
+    denom_x = float(max(x1 - x0, 1))
+    yy, xx = np.mgrid[0:h, 0:w]
+    v_map[c] = ((yy[c] - y0) / denom_y).astype(np.float32)
+    u_map[c] = ((xx[c] - x0) / denom_x).astype(np.float32)
+    return u_map, v_map
+
+
+def _cond_uv_maps_batch(cond: torch.Tensor):
+    device = cond.device
+    b = cond.size(0)
+    u_list, v_list = [], []
+    for i in range(b):
+        c = (cond[i, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+        u_map, v_map = _cond_uv_maps(c)
+        u_list.append(torch.from_numpy(u_map))
+        v_list.append(torch.from_numpy(v_map))
+    u_t = torch.stack(u_list, dim=0).unsqueeze(1).to(device)
+    v_t = torch.stack(v_list, dim=0).unsqueeze(1).to(device)
+    return u_t, v_t
+
+
+def _uv_histogram(
+    mask: torch.Tensor,
+    u_map: torch.Tensor,
+    v_map: torch.Tensor,
+    bins: int = UV_HIST_BINS,
+) -> torch.Tensor:
+    """mask 质量在 cond 归一化 (u,v) 平面上的分布。"""
+    m = mask.clamp(0.0, 1.0)
+    b = m.size(0)
+    out = []
+    n_bins = bins * bins
+    for i in range(b):
+        mi = m[i, 0]
+        ui = u_map[i, 0]
+        vi = v_map[i, 0]
+        active = mi > 0.05
+        if int(active.sum()) < 1:
+            out.append(torch.zeros(n_bins, device=m.device))
+            continue
+        u_vals = (ui[active] * float(bins - 1e-3)).long().clamp(0, bins - 1)
+        v_vals = (vi[active] * float(bins - 1e-3)).long().clamp(0, bins - 1)
+        weights = mi[active]
+        hist = torch.zeros(n_bins, device=m.device)
+        idx = u_vals * bins + v_vals
+        hist.index_add_(0, idx, weights)
+        hist = hist / hist.sum().clamp_min(1e-6)
+        out.append(hist)
+    return torch.stack(out, dim=0)
+
+
+def compute_dataset_uv_hist_prior(dataset):
+    """训练集 GT 在 cond 归一化 uv 平面上的平均分布（prior / 推理选模）。"""
+    hists = []
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    for cond, gt in loader:
+        u_map, v_map = _cond_uv_maps_batch(cond)
+        hists.append(_uv_histogram(gt, u_map, v_map)[0].cpu().numpy())
+    if not hists:
+        n = UV_HIST_BINS * UV_HIST_BINS
+        return np.ones(n, dtype=np.float32) / n
+    mean_hist = np.mean(np.stack(hists, axis=0), axis=0).astype(np.float32)
+    mean_hist = mean_hist / max(float(mean_hist.sum()), 1e-6)
+    return mean_hist
+
+
+def _centroid_cond_norm_batch(mask: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    """质量加权质心，cond 外接框归一化坐标，shape [B, 2] (u, v)。"""
+    b = mask.size(0)
+    device = mask.device
+    out = []
+    for i in range(b):
+        m = mask[i, 0].detach().cpu().numpy()
+        c = (cond[i, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+        u_map, v_map = _cond_uv_maps(c)
+        active = m > 0.05
+        if int(active.sum()) < 1:
+            out.append([0.5, 0.5])
+            continue
+        w = m[active].astype(np.float64)
+        cu = float((u_map[active] * w).sum() / max(w.sum(), 1e-6))
+        cv = float((v_map[active] * w).sum() / max(w.sum(), 1e-6))
+        out.append([cu, cv])
+    return torch.tensor(out, device=device, dtype=mask.dtype)
+
+
+def _centroid_loss(pred: torch.Tensor, gt: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    return F.l1_loss(_centroid_cond_norm_batch(pred, cond), _centroid_cond_norm_batch(gt, cond))
+
+
 def _cond_neighbor_band(cond: torch.Tensor, radius: int = BAND_RADIUS) -> torch.Tensor:
     c = (cond > 0.5).float()
     k = 2 * int(radius) + 1
@@ -267,7 +377,7 @@ def _base_spatial_losses(recon_x, cond, area_min, area_max, target_inside_cond):
     }
 
 
-def _add_spatial_weights(spatial, total, logs, rel_hist=None, band=None):
+def _add_spatial_weights(spatial, total, logs, rel_hist=None, band=None, uv_hist=None, centroid=None):
     total = (
         total
         + COND_OVERLAP_WEIGHT * spatial["overlap"]
@@ -283,6 +393,12 @@ def _add_spatial_weights(spatial, total, logs, rel_hist=None, band=None):
     if band is not None:
         total = total + BAND_OVERLAP_WEIGHT * band
         logs["band"] = band.detach()
+    if uv_hist is not None:
+        total = total + UV_HIST_WEIGHT * uv_hist
+        logs["uv_hist"] = uv_hist.detach()
+    if centroid is not None:
+        total = total + CENTROID_WEIGHT * centroid
+        logs["centroid"] = centroid.detach()
     return total, logs
 
 
@@ -293,18 +409,25 @@ def loss_recon_path(recon_x, x, mu, logvar, cond, area_min, area_max, kl_weight)
     pred_hist = _rel_histogram(recon_x, dt, width)
     gt_hist = _rel_histogram(x, dt, width)
     rel_hist = _rel_hist_loss(pred_hist, gt_hist)
+    u_map, v_map = _cond_uv_maps_batch(cond)
+    pred_uv = _uv_histogram(recon_x, u_map, v_map)
+    gt_uv = _uv_histogram(x, u_map, v_map)
+    uv_hist = _rel_hist_loss(pred_uv, gt_uv)
     band = _band_overlap_loss(recon_x, x, _cond_neighbor_band(cond))
+    centroid = _centroid_loss(recon_x, x, cond)
     bce = _foreground_bce(recon_x, x, cond)
     dice = _dice_loss(recon_x, x)
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
     total = BCE_WEIGHT * bce + DICE_WEIGHT * dice + kl_weight * kld
     logs = {"bce": bce.detach(), "dice": dice.detach(), "kld": kld.detach()}
-    total, logs = _add_spatial_weights(spatial, total, logs, rel_hist=rel_hist, band=band)
+    total, logs = _add_spatial_weights(
+        spatial, total, logs, rel_hist=rel_hist, band=band, uv_hist=uv_hist, centroid=centroid
+    )
     return total, logs
 
 
-def loss_prior_path(recon_x, cond, area_min, area_max, target_inside_mean, rel_hist_prior):
+def loss_prior_path(recon_x, gt, cond, area_min, area_max, target_inside_mean, rel_hist_prior, uv_hist_prior):
     target_inside = torch.full(
         (recon_x.size(0), 1, 1, 1),
         float(target_inside_mean),
@@ -316,11 +439,17 @@ def loss_prior_path(recon_x, cond, area_min, area_max, target_inside_mean, rel_h
     pred_hist = _rel_histogram(recon_x, dt, width)
     prior_t = torch.from_numpy(rel_hist_prior).to(recon_x.device)
     rel_hist = _rel_hist_loss(pred_hist, prior_t)
+    u_map, v_map = _cond_uv_maps_batch(cond)
+    pred_uv = _uv_histogram(recon_x, u_map, v_map)
+    uv_prior_t = torch.from_numpy(uv_hist_prior).to(recon_x.device)
+    uv_hist = _rel_hist_loss(pred_uv, uv_prior_t)
+    band = _band_overlap_loss(recon_x, gt, _cond_neighbor_band(cond))
+    centroid = _centroid_loss(recon_x, gt, cond)
     empty_pen = _empty_penalty(recon_x, area_min)
 
-    total = EMPTY_WEIGHT * empty_pen
-    logs = {"empty": empty_pen.detach()}
-    total, logs = _add_spatial_weights(spatial, total, logs, rel_hist=rel_hist)
+    total = EMPTY_WEIGHT * empty_pen + PRIOR_BAND_WEIGHT * band + CENTROID_WEIGHT * centroid
+    logs = {"empty": empty_pen.detach(), "band": band.detach(), "centroid": centroid.detach()}
+    total, logs = _add_spatial_weights(spatial, total, logs, rel_hist=rel_hist, uv_hist=uv_hist)
     return total, logs
 
 
@@ -332,7 +461,15 @@ def _kl_weight_for_epoch(epoch):
 
 
 def _run_epoch(
-    model, loader, device, area_bounds, cond_bounds, rel_hist_prior, optimizer=None, epoch=0
+    model,
+    loader,
+    device,
+    area_bounds,
+    cond_bounds,
+    rel_hist_prior,
+    uv_hist_prior,
+    optimizer=None,
+    epoch=0,
 ):
     training = optimizer is not None
     model.train(training)
@@ -342,7 +479,7 @@ def _run_epoch(
 
     keys = [
         "loss", "recon", "prior", "bce", "dice", "kld",
-        "overlap", "outside", "area", "rel_hist", "band", "empty",
+        "overlap", "outside", "area", "rel_hist", "uv_hist", "band", "centroid", "empty",
     ]
     running = {k: 0.0 for k in keys}
 
@@ -364,6 +501,9 @@ def _run_epoch(
                 "outside": 0.0,
                 "area": 0.0,
                 "rel_hist": 0.0,
+                "uv_hist": 0.0,
+                "band": 0.0,
+                "centroid": 0.0,
                 "empty": 0.0,
             }
             for _ in range(PRIOR_SAMPLES):
@@ -371,11 +511,13 @@ def _run_epoch(
                 prior_recon = model.decode(z, cond_mask)
                 p_loss, p_logs = loss_prior_path(
                     prior_recon,
+                    gt_mask,
                     cond_mask,
                     area_min,
                     area_max,
                     inside_mean,
                     rel_hist_prior,
+                    uv_hist_prior,
                 )
                 prior_losses.append(p_loss)
                 for k in prior_logs:
@@ -399,7 +541,9 @@ def _run_epoch(
             running["outside"] += recon_logs["outside"].item() + prior_logs["outside"]
             running["area"] += recon_logs["area"].item() + prior_logs["area"]
             running["rel_hist"] += recon_logs["rel_hist"].item() + prior_logs["rel_hist"]
-            running["band"] += recon_logs["band"].item()
+            running["uv_hist"] += recon_logs["uv_hist"].item() + prior_logs["uv_hist"]
+            running["band"] += recon_logs["band"].item() + prior_logs["band"]
+            running["centroid"] += recon_logs["centroid"].item() + prior_logs["centroid"]
             running["empty"] += prior_logs["empty"]
 
     denom = max(len(loader), 1)
@@ -408,7 +552,14 @@ def _run_epoch(
 
 @torch.no_grad()
 def _evaluate_generative(
-    model, dataset, device, area_bounds, cond_bounds, rel_hist_prior, num_z=GEN_EVAL_Z
+    model,
+    dataset,
+    device,
+    area_bounds,
+    cond_bounds,
+    rel_hist_prior,
+    uv_hist_prior,
+    num_z=GEN_EVAL_Z,
 ):
     model.eval()
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
@@ -416,15 +567,28 @@ def _evaluate_generative(
     _, _, inside_mean = cond_bounds
     target_inside = torch.tensor([[inside_mean]], device=device)
     prior_t = torch.from_numpy(rel_hist_prior)
+    uv_prior_t = torch.from_numpy(uv_hist_prior)
 
     total_score = 0.0
-    total_overlap = total_outside = total_rel_hist = total_area_pen = total_empty = 0.0
+    totals = {
+        "overlap": 0.0,
+        "outside": 0.0,
+        "rel_hist": 0.0,
+        "uv_hist": 0.0,
+        "band": 0.0,
+        "centroid": 0.0,
+        "area_pen": 0.0,
+        "empty": 0.0,
+    }
     n = 0
 
-    for cond_mask, _gt_mask in loader:
+    for cond_mask, gt_mask in loader:
         cond_mask = cond_mask.to(device)
+        gt_mask = gt_mask.to(device)
         sample_score = 0.0
         dt, width = _cond_morphology_batch(cond_mask)
+        u_map, v_map = _cond_uv_maps_batch(cond_mask)
+        band = _cond_neighbor_band(cond_mask)
 
         for _ in range(num_z):
             z = torch.randn(1, LATENT_DIM, device=device)
@@ -434,16 +598,32 @@ def _evaluate_generative(
             outside = _excess_outside_cond_loss(pred_inside, target_inside).item()
             pred_hist = _rel_histogram(recon, dt, width)
             rel_hist = _rel_hist_loss(pred_hist, prior_t).item()
+            pred_uv = _uv_histogram(recon, u_map, v_map)
+            uv_hist = _rel_hist_loss(pred_uv, uv_prior_t).item()
+            band_loss = _band_overlap_loss(recon, gt_mask, band).item()
+            centroid = _centroid_loss(recon, gt_mask, cond_mask).item()
             pred_area = float(recon.sum().item())
             area_pen = (max(0.0, area_min - pred_area) + max(0.0, pred_area - area_max)) / IMG_AREA
             empty = 1.0 if pred_area < area_min * 0.2 else 0.0
-            sample_score += overlap + outside + rel_hist + area_pen + 5.0 * empty
+            sample_score += (
+                overlap
+                + outside
+                + rel_hist
+                + area_pen
+                + 5.0 * empty
+                + GEN_W_BAND * band_loss
+                + GEN_W_CENTROID * centroid
+                + GEN_W_UV_HIST * uv_hist
+            )
 
-            total_overlap += overlap
-            total_outside += outside
-            total_rel_hist += rel_hist
-            total_area_pen += area_pen
-            total_empty += empty
+            totals["overlap"] += overlap
+            totals["outside"] += outside
+            totals["rel_hist"] += rel_hist
+            totals["uv_hist"] += uv_hist
+            totals["band"] += band_loss
+            totals["centroid"] += centroid
+            totals["area_pen"] += area_pen
+            totals["empty"] += empty
 
         total_score += sample_score / float(num_z)
         n += 1
@@ -454,19 +634,18 @@ def _evaluate_generative(
             "overlap": 1.0,
             "outside": 1.0,
             "rel_hist": 1.0,
+            "uv_hist": 1.0,
+            "band": 1.0,
+            "centroid": 1.0,
             "area_pen": 1.0,
             "empty_rate": 1.0,
         }
 
     z_total = n * num_z
-    return {
-        "score": total_score / n,
-        "overlap": total_overlap / z_total,
-        "outside": total_outside / z_total,
-        "rel_hist": total_rel_hist / z_total,
-        "area_pen": total_area_pen / z_total,
-        "empty_rate": total_empty / z_total,
-    }
+    out = {"score": total_score / n, "empty_rate": totals["empty"] / z_total}
+    for k in ("overlap", "outside", "rel_hist", "uv_hist", "band", "centroid", "area_pen"):
+        out[k] = totals[k] / z_total
+    return out
 
 
 def train_model(dataset, category, defect, weights_dir, epochs):
@@ -474,6 +653,7 @@ def train_model(dataset, category, defect, weights_dir, epochs):
     area_bounds = compute_dataset_area_bounds(dataset)
     cond_bounds = compute_dataset_cond_stats(dataset)
     rel_hist_prior = compute_dataset_rel_hist_prior(dataset)
+    uv_hist_prior = compute_dataset_uv_hist_prior(dataset)
     area_min, area_max, area_mean = area_bounds
     inside_min, inside_max, inside_mean = cond_bounds
     print(
@@ -486,6 +666,10 @@ def train_model(dataset, category, defect, weights_dir, epochs):
     print(
         f"[*] [{category}/{defect}] cond 形态直方图 (DT×宽度): bins={REL_HIST_BINS_DT}x{REL_HIST_BINS_WIDTH}, "
         f"peak={rel_hist_prior.max():.4f}"
+    )
+    print(
+        f"[*] [{category}/{defect}] cond 归一化位置 (u×v): bins={UV_HIST_BINS}x{UV_HIST_BINS}, "
+        f"peak={uv_hist_prior.max():.4f}"
     )
 
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
@@ -504,11 +688,12 @@ def train_model(dataset, category, defect, weights_dir, epochs):
             area_bounds,
             cond_bounds,
             rel_hist_prior,
+            uv_hist_prior,
             optimizer=optimizer,
             epoch=epoch,
         )
         gen_logs = _evaluate_generative(
-            model, dataset, device, area_bounds, cond_bounds, rel_hist_prior
+            model, dataset, device, area_bounds, cond_bounds, rel_hist_prior, uv_hist_prior
         )
 
         current_metric = gen_logs["score"]
@@ -523,9 +708,11 @@ def train_model(dataset, category, defect, weights_dir, epochs):
             f"[{category}/{defect}] Epoch [{epoch + 1}/{epochs}] "
             f"train_loss: {train_logs['loss']:.4f} recon: {train_logs['recon']:.4f} prior: {train_logs['prior']:.4f} "
             f"dice: {train_logs['dice']:.4f} overlap: {train_logs['overlap']:.4f} outside: {train_logs['outside']:.4f} "
-            f"rel_hist: {train_logs['rel_hist']:.4f} band: {train_logs['band']:.4f} "
+            f"rel_hist: {train_logs['rel_hist']:.4f} uv_hist: {train_logs['uv_hist']:.4f} "
+            f"band: {train_logs['band']:.4f} centroid: {train_logs['centroid']:.4f} "
             f"area: {train_logs['area']:.4f} empty: {train_logs['empty']:.4f} | "
-            f"gen_score: {gen_logs['score']:.4f} gen_rel_hist: {gen_logs['rel_hist']:.4f} "
+            f"gen_score: {gen_logs['score']:.4f} gen_uv: {gen_logs['uv_hist']:.4f} "
+            f"gen_band: {gen_logs['band']:.4f} gen_cent: {gen_logs['centroid']:.4f} "
             f"gen_empty: {gen_logs['empty_rate']:.3f}"
         )
 

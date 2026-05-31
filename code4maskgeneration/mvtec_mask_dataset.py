@@ -36,6 +36,37 @@ def list_training_defect_types(gt_dir):
     )
 
 
+def _shift_mask_pair(fg_tensor, gt_tensor, max_px):
+    """同步平移 cond/gt（零填充），打破固定画布中心偏置。"""
+    if max_px <= 0:
+        return fg_tensor, gt_tensor
+    dy = random.randint(-int(max_px), int(max_px))
+    dx = random.randint(-int(max_px), int(max_px))
+    if dy == 0 and dx == 0:
+        return fg_tensor, gt_tensor
+
+    def _shift_one(x):
+        c, h, w = x.shape
+        out = torch.zeros_like(x)
+        if dy >= 0:
+            ys, yt = 0, dy
+            ye = h - dy
+        else:
+            ys, yt = -dy, 0
+            ye = h + dy
+        if dx >= 0:
+            xs, xt = 0, dx
+            xe = w - dx
+        else:
+            xs, xt = -dx, 0
+            xe = w + dx
+        if ye > ys and xe > xs:
+            out[:, yt : yt + (ye - ys), xt : xt + (xe - xs)] = x[:, ys:ye, xs:xe]
+        return out
+
+    return _shift_one(fg_tensor), _shift_one(gt_tensor)
+
+
 class Mask2MaskDataset(Dataset):
     def __init__(
         self,
@@ -44,11 +75,13 @@ class Mask2MaskDataset(Dataset):
         defect_type=None,
         img_size=512,
         augment=True,
+        translate_max_px=40,
     ):
         self.root_dir = root_dir
         self.category = category
         self.img_size = img_size
         self.augment = augment
+        self.translate_max_px = int(translate_max_px) if augment else 0
         self.samples = []
 
         gt_dir = os.path.join(root_dir, category, "Ground_truth")
@@ -118,6 +151,9 @@ class Mask2MaskDataset(Dataset):
             [self.img_size, self.img_size],
             interpolation=TF.InterpolationMode.NEAREST,
         )
+
+        if self.augment and self.translate_max_px > 0:
+            fg_tensor, gt_tensor = _shift_mask_pair(fg_tensor, gt_tensor, self.translate_max_px)
 
         fg_tensor = (fg_tensor > 0.5).float()
         gt_tensor = (gt_tensor > 0.5).float()
